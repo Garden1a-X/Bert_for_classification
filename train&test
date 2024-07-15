@@ -1,0 +1,173 @@
+import os
+import json
+import torch
+import pandas as pd
+from torch.utils.data import Dataset
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments, EarlyStoppingCallback
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+from torch.nn import DataParallel
+
+# 清空缓存
+torch.cuda.empty_cache()
+
+# 设置环境变量，以解决特定GPU的通信问题
+os.environ['CUDA_VISIBLE_DEVICES'] = "2,3,4,5"
+os.environ['NCCL_P2P_DISABLE'] = "1"
+os.environ['NCCL_IB_DISABLE'] = "1"
+
+# 读取新生成的CSV文件，假设文件名为 'extracted_data_with_newlines.csv'
+csv_file = 'code_author_discriminant/extracted_data_with_newlines.csv'
+df = pd.read_csv(csv_file)
+
+# 检查第三列是否是换行符的数量，如果不是，你需要替换 'newline_count' 为实际的列名
+# 过滤换行符数量大于2的样本
+df_filtered_by_newlines = df[df['newline_count'] > 2]
+
+# 过滤样本数量大于10的作者
+author_counts = df_filtered_by_newlines['user_id'].value_counts()
+authors_to_keep = author_counts[author_counts > 10].index.tolist()
+df_final = df_filtered_by_newlines[df_filtered_by_newlines['user_id'].isin(authors_to_keep)]
+
+print('换行符数量大于2且样本数量大于10的总作者数：', len(authors_to_keep))
+
+# 分离特征和标签
+X = df_final.iloc[:, 1].tolist()  # 代码片段
+y = df_final['user_id'].tolist()  # 作者ID
+
+# 将作者ID映射为数字标签
+label_mapping = {author: i for i, author in enumerate(authors_to_keep)}
+y_mapped = [label_mapping[author] for author in y]
+
+# 分割数据集
+train_X, test_X, train_y, test_y = train_test_split(
+    X, y_mapped, test_size=0.2, stratify=y_mapped, random_state=42
+)
+
+# 定义数据集类
+class CodeDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        label = self.labels[idx]
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# 初始化BERT分词器和模型
+tokenizer = BertTokenizer.from_pretrained('/mnt/data122/hhx/ckp/bert-base-uncased')
+model = BertForSequenceClassification.from_pretrained(
+    '/mnt/data122/hhx/ckp/bert-base-uncased',
+    num_labels=len(authors_to_keep)
+)
+
+# 创建数据集对象
+train_dataset = CodeDataset(train_X, train_y, tokenizer, max_len=512)
+test_dataset = CodeDataset(test_X, test_y, tokenizer, max_len=512)
+
+# 检查数据集长度
+assert len(train_dataset) > 0, "Training dataset is empty"
+assert len(test_dataset) > 0, "Testing dataset is empty"
+
+# 定义训练参数
+training_args = TrainingArguments(
+    output_dir='code_author_discriminant/results',
+    num_train_epochs=5,
+    per_device_train_batch_size=4,  # 减小批次大小
+    per_device_eval_batch_size=16,  # 根据需要调整
+    warmup_steps=200,
+    weight_decay=0.01,
+    eval_strategy="steps",
+    eval_steps=200,
+    save_strategy="steps",
+    save_steps=200,
+    logging_steps=200,
+    gradient_accumulation_steps=4,  # 增加梯度累积步数
+    save_total_limit=4,
+    report_to=None,
+    load_best_model_at_end=True,
+)
+
+# 自定义评估指标计算函数
+def compute_metrics(eval_pred):
+    # 将predictions和label_ids从NumPy数组转换为张量
+    logits, labels = eval_pred
+    logits = torch.tensor(logits)  # 转换logits为张量
+    labels = torch.tensor(labels)  # 转换labels为张量
+
+    # 使用torch.argmax获取预测类别
+    predictions = torch.argmax(logits, dim=-1)
+
+    # 计算准确率和F1分数
+    accuracy = accuracy_score(labels.cpu().numpy(), predictions.cpu().numpy())
+    f1 = f1_score(labels.cpu().numpy(), predictions.cpu().numpy(), average='weighted')
+
+    return {'accuracy': accuracy, 'f1': f1}
+
+# 创建Trainer对象
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
+    compute_metrics=compute_metrics,  # 使用自定义的compute_metrics函数
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)] 
+)
+
+# 训练模型前清理缓存
+torch.cuda.empty_cache()
+
+# 训练模型
+trainer.train()
+
+# 评估模型
+eval_results = trainer.evaluate()
+
+# 打印评估结果中的准确率和F1分数
+print(f"测试集上的分类准确率: {eval_results['eval_accuracy']}")
+print(f"测试集上的F1分数: {eval_results['eval_f1']}")
+
+# 获取预测结果
+predictions = trainer.predict(test_dataset)
+predicted_labels = torch.tensor(predictions.predictions).argmax(-1)
+
+# 将预测标签转换回作者ID
+predicted_authors = [label_mapping[i] for i in predicted_labels]
+
+# 将实际标签转换回作者ID
+true_authors = df_final['user_id'].tolist()
+
+# 找出被错误分类的代码及其作者
+misclassified_codes = []
+for idx, (true_author, predicted_author) in enumerate(zip(true_authors, predicted_authors)):
+    if true_author != predicted_author:
+        misclassified_codes.append({
+            'true_author': true_author,
+            'predicted_author': predicted_author,
+            'code': test_X[idx]
+        })
+
+# 将错误分类的代码及其作者信息保存到 JSON 文件中
+with open('code_author_discriminant/miss_classified.json', 'w', encoding='utf-8') as f:
+    json.dump(misclassified_codes, f, ensure_ascii=False, indent=4)
+
+# 训练后再次清理缓存
+torch.cuda.empty_cache()
